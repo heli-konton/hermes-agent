@@ -8,6 +8,7 @@ from uuid import uuid4
 from typing import Any, List, Mapping, MutableMapping, Optional, TypeVar
 
 from agent.conversation_compression_archive import MERGED_DURABLE_ROWS, RETIRED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS
+from agent.message_content import flatten_message_text
 
 
 # These fields describe Hermes' durable record and timeline display, not
@@ -58,6 +59,19 @@ PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset(
 DATA_USE = "data_use"
 
 
+def _set_display_metadata_key(message: MutableMapping[str, Any], key: str, value: Any) -> None:
+    """Set *key* in *message*'s ``display_metadata`` as a new dict (a non-dict value starts empty)."""
+    metadata = message.get("display_metadata")
+    message["display_metadata"] = {**(metadata if isinstance(metadata, dict) else {}), key: value}
+
+
+def _display_metadata_str(message: Any, key: str) -> Optional[str]:
+    """*message*'s ``display_metadata[key]`` when it is a string, else None."""
+    metadata = message.get("display_metadata") if isinstance(message, Mapping) else None
+    value = metadata.get(key) if isinstance(metadata, Mapping) else None
+    return value if isinstance(value, str) else None
+
+
 def data_use_requirement(messages: Any) -> frozenset[str]:
     """The union of ``data_use`` over *messages*: what the model receiving them must guarantee."""
     return frozenset(r for m in messages or () if isinstance(m, Mapping) for r in m.get(DATA_USE) or ())
@@ -69,8 +83,7 @@ def stamp_data_use(message: MutableMapping[str, Any], requires: list[str]) -> No
     if not requires:
         return
     message[DATA_USE] = list(requires)
-    metadata = message.get("display_metadata")
-    message["display_metadata"] = {**(metadata if isinstance(metadata, dict) else {}), DATA_USE: list(requires)}
+    _set_display_metadata_key(message, DATA_USE, list(requires))
 
 
 # What the user typed on a turn a ``pre_llm_call`` hook vetoed, kept inside ``display_metadata``. The row's
@@ -81,11 +94,33 @@ WITHHELD_PROMPT = "withheld_prompt"
 PRE_LLM_BLOCK_WITHHELD_PROMPT = "[Message withheld: a pre_llm_call policy hook blocked it.]"
 
 
+# The ask of a multimodal turn (the text of its persisted parts: image-path hints, not ``[screenshot]``), kept inside
+# ``display_metadata`` when the turn's injected context (recalled memory, ``pre_llm_call`` and gateway notes)
+# is appended to ``content`` as a text part: the DB stores that content as one flattened string, so nothing
+# else can tell the ask from the injection.
+TYPED_ASK = "typed_ask"
+
+
+def stamp_typed_ask(message: MutableMapping[str, Any], text: str) -> None:
+    """Record *text* as the ask ``previous_message`` reads for *message*."""
+    _set_display_metadata_key(message, TYPED_ASK, text)
+
+
+def drop_typed_ask(message: MutableMapping[str, Any]) -> None:
+    """Forget the typed-ask stamp on a row whose content no longer is that one ask (a fold, a redaction)."""
+    metadata = message.get("display_metadata")
+    if isinstance(metadata, dict) and TYPED_ASK in metadata:
+        message["display_metadata"] = {k: v for k, v in metadata.items() if k != TYPED_ASK}
+
+
+def typed_ask_text(message: Any) -> Optional[str]:
+    """The typed ask stamped on *message*, else None."""
+    return _display_metadata_str(message, TYPED_ASK)
+
+
 def withheld_prompt_text(message: Any) -> Optional[str]:
     """The typed text a transcript view shows for a vetoed user row, else None."""
-    metadata = message.get("display_metadata") if isinstance(message, Mapping) else None
-    text = metadata.get(WITHHELD_PROMPT) if isinstance(metadata, Mapping) else None
-    return text if isinstance(text, str) else None
+    return _display_metadata_str(message, WITHHELD_PROMPT)
 
 
 def typed_prompt_content(content: Any, message: Any) -> Any:
@@ -181,8 +216,7 @@ INFLIGHT_TASK_RESTATEMENT = "compaction_inflight_task_restatement"
 
 
 def mark_inflight_restatement(msg: MutableMapping[str, Any]) -> None:
-    metadata = msg.get("display_metadata")
-    msg["display_metadata"] = {**(metadata if isinstance(metadata, dict) else {}), INFLIGHT_TASK_RESTATEMENT: True}
+    _set_display_metadata_key(msg, INFLIGHT_TASK_RESTATEMENT, True)
 
 
 def scaffolding_replay_fields(msg: Mapping[str, Any]) -> dict:
@@ -192,6 +226,23 @@ def scaffolding_replay_fields(msg: Mapping[str, Any]) -> dict:
     fields: dict = {"_compressed_summary": True} if msg.get("_compressed_summary") else {}
     if isinstance(metadata, dict) and metadata.get(INFLIGHT_TASK_RESTATEMENT):
         fields["display_metadata"] = {INFLIGHT_TASK_RESTATEMENT: True}
+    return fields
+
+
+def typed_ask_fields(msg: Mapping[str, Any]) -> dict:
+    """``{"display_metadata": {TYPED_ASK: ...}}`` for a user row carrying the stamp, else ``{}``: for a
+    row rebuilt from *msg*'s content, which still holds the flattened injected context."""
+    if msg.get("role") == "user" and "display_metadata" in msg and (typed := typed_ask_text(msg)) is not None:
+        return {"display_metadata": {TYPED_ASK: typed}}
+    return {}
+
+
+def replay_metadata_fields(msg: Mapping[str, Any]) -> dict:
+    """``scaffolding_replay_fields`` plus a user row's typed-ask stamp (``previous_message`` must not read
+    a multimodal turn's flattened injected context back)."""
+    fields = scaffolding_replay_fields(msg)
+    if typed := typed_ask_fields(msg):
+        fields["display_metadata"] = {**fields.get("display_metadata", {}), **typed["display_metadata"]}
     return fields
 
 
@@ -226,6 +277,33 @@ def message_identity(msg: MutableMapping[str, Any], *, with_tool_uids: bool = Fa
     return identity
 
 
+def _fold_typed_ask(survivor: MutableMapping[str, Any], dropped: Mapping[str, Any], dropped_leads: bool) -> None:
+    """Keep the survivor's typed-ask stamp true after *dropped*'s text was folded into it: the content
+    now holds both turns (and a stamped turn's flattened notes), so a lost stamp would leak those notes
+    into ``previous_message``. The stamp joins each side's ask the way the content was joined (``\n\n``,
+    empty sides skipped).
+
+    A side's ask is its stamp; else a summary contributes none (a summary carrier's own ask, e.g. a task
+    an earlier compaction restated onto it, is in its stamp) and a plain row its text (for the survivor,
+    the joined text minus the dropped row's suffix: plain folds join strings). An anchor leading a
+    scaffolding turn is that row's only ask, so a scaffolding stamp on the survivor goes."""
+    from agent.context_compressor import is_compaction_summary_message
+
+    kept, theirs = typed_ask_text(survivor), typed_ask_text(dropped)
+    if kept is None and theirs is None:
+        return
+    if dropped_leads:
+        stamp_typed_ask(survivor, theirs) if theirs is not None else drop_typed_ask(survivor)
+        return
+    dropped_text = flatten_message_text(dropped.get("content"))
+    if theirs is None:
+        theirs = "" if is_compaction_summary_message(dropped) else dropped_text.strip()
+    if kept is None:
+        kept = "" if is_compaction_summary_message(survivor) else (
+            flatten_message_text(survivor.get("content")).removesuffix(dropped_text).rstrip())
+    stamp_typed_ask(survivor, "\n\n".join(text for text in (kept, theirs) if text))
+
+
 def record_absorbed_message(
     survivor: MutableMapping[str, Any], dropped: Mapping[str, Any], *, dropped_leads: bool = False,
 ) -> None:
@@ -236,8 +314,9 @@ def record_absorbed_message(
     text leads; with *dropped_leads* the dropped dict's text was put first (the real user anchor folded
     into a scaffolding turn), so its uid becomes the survivor's and the survivor's former uid is recorded.
     A dict without a uid (unflushed, scaffolding, engine-authored) contributes nothing; an empty result
-    leaves the survivor untouched.
+    leaves the survivor untouched. A typed-ask stamp follows the fold (``_fold_typed_ask``).
     """
+    _fold_typed_ask(survivor, dropped, dropped_leads)
     survivor_uid = message_uid_or_none(survivor)
     dropped_uid = message_uid_or_none(dropped)
     own = uid_list(survivor.get(ABSORBED_MESSAGE_UIDS))
